@@ -1,0 +1,41 @@
+name: CI
+
+# 这四个 crate 是 Windows 与 Linux 两个平台仓库共用的，坏了两边一起坏，所以两种 runner 都跑：
+# 路径分隔符、换行这类平台差异只在 Windows 上测得到（qiaob/baobox_mac#115 起共享层就在两边都跑）。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "claude/**"
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # 工具链固定版本：新版 clippy 会加新检查，不该让无关的提交突然变红。
+      # 升级时改这里（以及两个平台仓库的工作流），顺手修掉新冒出来的警告。
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets
