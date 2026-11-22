@@ -1,0 +1,5 @@
+# Baobox 共享库的 workspace：四个 crate 在一个仓库里，一条 cargo 命令一起检查、一起测。
+# 平台仓库（baobox_windows / baobox_linux）按 git 依赖逐个引用，不受这个文件影响。
+[workspace]
+members = ["baobox-core", "baobox-app", "baobox-image", "baobox-render"]
+resolver = "2"

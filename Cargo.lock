@@ -9,10 +9,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "baobox-app"
+version = "0.1.0"
+dependencies = [
+ "baobox-core",
+]
+
+[[package]]
+name = "baobox-core"
+version = "0.1.0"
+
+[[package]]
 name = "baobox-image"
 version = "0.1.0"
 dependencies = [
  "png",
+]
+
+[[package]]
+name = "baobox-render"
+version = "0.1.0"
+dependencies = [
+ "baobox-core",
 ]
 
 [[package]]
