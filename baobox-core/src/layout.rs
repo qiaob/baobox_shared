@@ -6,7 +6,7 @@
 //!
 //! # 坐标系：左上原点
 //!
-//! 与 `shared` 里其余部分一致（见 `docs/multiplatform/ARCHITECTURE.md`）。
+//! 与 `shared` 里其余部分一致（见 `docs/ARCHITECTURE.md`）。
 //! macOS 那份 Swift 用的是 AppKit 的**左下**原点，所以那边 `.top` 是
 //! **较大**的 y、这边 `.top` 是**较小**的 y —— 照抄那份代码的坐标会上下颠倒。
 //! 翻转在 mac 侧的边界上做，这里不管。

@@ -214,7 +214,7 @@ impl ReadError {
 }
 
 impl fmt::Display for ReadError {
-    /// 只说这一层，底层原因从 `source()` 拿（`docs/multiplatform/ERRORS.md` §5.3 的约定）。
+    /// 只说这一层，底层原因从 `source()` 拿（`docs/ERRORS.md` §5.3 的约定）。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotUtf8 { path, .. } => {
