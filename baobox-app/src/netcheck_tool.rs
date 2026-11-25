@@ -12,6 +12,11 @@
 //! - [`SystemTimezone`]：系统当前的 IANA 时区名（`Asia/Singapore`）。
 //!   Linux 读 `/etc/localtime` 的链接目标，Windows 要从 Windows 时区名换算
 //!
+//! 另有一个**可选**的 [`WebrtcProbe`]：在内置浏览器里建一个 `RTCPeerConnection`，
+//! 收集 ICE 候选原文。Mac 用隐藏的 `WKWebView`；Windows / Linux 将来接 WebView2 /
+//! WebKitGTK。平台不给（[`NetcheckTool::with_webrtc`] 没调），WebRTC 那一项就不测，
+//! 报告里写「本平台不检测」。
+//!
 //! DNS 探测用标准库的系统解析器（[`std::net::ToSocketAddrs`]）—— 那正是要测的那条路：
 //! 系统把查询交给谁，bash.ws 就看到谁。
 //!
@@ -49,6 +54,13 @@ pub type HttpGet = fn(url: &str) -> Result<String, String>;
 /// 系统当前的 IANA 时区名。拿不到返回 `None`（时区那一项就报「测不出」）。
 pub type SystemTimezone = fn() -> Option<String>;
 
+/// 在内置浏览器里跑 WebRTC，经给定的 STUN 服务器（`stun:host:port`）收集 ICE 候选，
+/// 返回候选原文（`candidate:…`），一条一个。浏览器起不来、超时返回 `Err(原因)`；
+/// 收集完一条都没有返回 `Ok(空)`（UDP 被挡住了，这是不会漏的情况）。
+///
+/// 会在后台线程里被调用，平台要自己切回 UI 线程建浏览器、阻塞等结果（**要设超时**）。
+pub type WebrtcProbe = fn(stun: &str) -> Result<Vec<String>, String>;
+
 /// 用系统解析器解析一个域名。结果不要紧，要的是「查询发出去了」。
 pub type Resolve = fn(host: &str);
 
@@ -72,6 +84,8 @@ pub struct Settings {
     pub real_networks: String,
     /// DNS 探测解析几个域名
     pub dns_probes: usize,
+    /// WebRTC 用的 STUN 服务器
+    pub stun_server: String,
 }
 
 impl Settings {
@@ -84,6 +98,7 @@ impl Settings {
             api_key: String::new(),
             real_networks: String::new(),
             dns_probes: 10,
+            stun_server: "stun:stun.l.google.com:19302".to_string(),
         }
     }
 
@@ -107,6 +122,7 @@ impl Settings {
             dns_probes: config
                 .usize_or(ID, "dns_probes", defaults.dns_probes)
                 .clamp(1, 50),
+            stun_server: or_default("stun_server", &defaults.stun_server),
         }
     }
 }
@@ -120,6 +136,8 @@ pub struct Env {
     pub system_timezone: SystemTimezone,
     /// 系统解析器
     pub resolve: Resolve,
+    /// 内置浏览器跑 WebRTC。`None` = 这个平台不测
+    pub webrtc: Option<WebrtcProbe>,
 }
 
 /// 在一个地址后面拼查询参数，已经有 `?` 就用 `&`。
@@ -198,6 +216,7 @@ pub fn run_checks(settings: &Settings, env: &Env) -> Observations {
         ipv6: ipv6_exit(settings, env),
         dns: dns_leak(settings, env),
         system_timezone: (env.system_timezone)(),
+        webrtc: env.webrtc.map(|probe| probe(&settings.stun_server)),
     }
 }
 
@@ -206,7 +225,9 @@ pub fn run_checks(settings: &Settings, env: &Env) -> Observations {
 pub struct Outcome {
     /// 什么时候测完的（Unix 秒）
     pub at: i64,
-    /// 四项结论
+    /// 两个问题的回答（[`netcheck::summarize`]）
+    pub summary: Vec<Finding>,
+    /// 各项结论
     pub findings: Vec<Finding>,
     /// bash.ws 自己的结论文字（有的话）
     pub dns_conclusion: Option<String>,
@@ -237,7 +258,14 @@ impl NetcheckTool {
             http_get,
             system_timezone,
             resolve: resolve_with_system,
+            webrtc: None,
         })
+    }
+
+    /// 平台有内置浏览器：加上 WebRTC 那一项。
+    pub fn with_webrtc(mut self, probe: WebrtcProbe) -> Self {
+        self.env.webrtc = Some(probe);
+        self
     }
 
     /// 连解析器也换掉（测试用）。
@@ -277,22 +305,32 @@ impl NetcheckTool {
                 .as_ref()
                 .ok()
                 .and_then(|d| d.conclusion.clone());
+            let findings = netcheck::evaluate(&observations, &real);
             let _ = tx.send(Outcome {
                 at: now_seconds(),
-                findings: netcheck::evaluate(&observations, &real),
+                summary: netcheck::summarize(&observations, &findings),
+                findings,
                 dns_conclusion,
             });
         });
     }
 
-    /// 完整报告：标题 + 每项一行 + bash.ws 的原话 + 怎么声明真实网络。
+    /// 完整报告：标题 + 两个问题的回答 + 每项一行 + bash.ws 的原话 + 提示。
     pub fn report_text(&self) -> Option<String> {
         let outcome = self.last.as_ref()?;
         let mut lines = vec![format!(
             "网络泄露检测：{}",
             headline(netcheck::overall(&outcome.findings))
         )];
+        lines.push(String::new());
+        lines.push("总结".to_string());
+        lines.extend(outcome.summary.iter().map(Finding::line));
+        lines.push(String::new());
+        lines.push("各项".to_string());
         lines.extend(outcome.findings.iter().map(Finding::line));
+        if self.env.webrtc.is_none() {
+            lines.push("· WebRTC：本平台不检测（没有内置浏览器）".to_string());
+        }
         if let Some(words) = &outcome.dns_conclusion {
             lines.push(format!("bash.ws 的结论：{words}"));
         }
@@ -303,6 +341,9 @@ impl NetcheckTool {
                     .to_string(),
             );
         }
+        lines.push(
+            "这里测的是网络层。App 若有定位权限，会直接用 GPS / Wi-Fi 定位，与隧道无关".to_string(),
+        );
         Some(lines.join("\n"))
     }
 }
@@ -327,6 +368,10 @@ impl ToolModule for NetcheckTool {
                     "{}（{ago}前）",
                     headline(netcheck::overall(&outcome.findings))
                 )));
+                for finding in &outcome.summary {
+                    items.push(MenuItem::disabled(&finding.line()));
+                }
+                items.push(MenuItem::Separator);
                 for finding in &outcome.findings {
                     items.push(MenuItem::disabled(&finding.line()));
                 }
@@ -388,6 +433,13 @@ impl ToolModule for NetcheckTool {
                     &defaults.dns_endpoint,
                     &defaults.dns_endpoint,
                 ),
+                Field::text(
+                    "stun_server",
+                    "WebRTC 用的 STUN 服务器",
+                    &defaults.stun_server,
+                    &defaults.stun_server,
+                )
+                .with_help("只在有内置浏览器的平台上用：网页经它拿到的公网地址应当就是出口 IP"),
             ],
         ))
     }
@@ -502,7 +554,26 @@ mod tests {
             http_get,
             system_timezone: singapore,
             resolve: no_resolve,
+            webrtc: None,
         }
+    }
+
+    /// 浏览器经 STUN 拿到了出口 IP。
+    fn webrtc_clean(stun: &str) -> Result<Vec<String>, String> {
+        assert_eq!(stun, "stun:stun.l.google.com:19302");
+        Ok(vec![
+            "candidate:1 1 udp 2113937151 abc.local 5000 typ host".to_string(),
+            "candidate:2 1 udp 1677729535 34.3.107.77 6000 typ srflx raddr 0.0.0.0 rport 0"
+                .to_string(),
+        ])
+    }
+
+    /// UDP 走了真实网络。
+    fn webrtc_leaking(_: &str) -> Result<Vec<String>, String> {
+        Ok(vec![
+            "candidate:2 1 udp 1677729535 82.66.115.249 6000 typ srflx raddr 0.0.0.0 rport 0"
+                .to_string(),
+        ])
     }
 
     fn settings(real: &str) -> Settings {
@@ -634,8 +705,33 @@ mod tests {
             .collect();
         assert!(labels.iter().any(|l| l.starts_with("! 出口：")));
         assert!(labels.iter().any(|l| l == "完整报告…"));
+        assert!(labels.iter().any(|l| l.contains(netcheck::GOAL_CARRIER)));
         let report = tool.perform(REPORT).unwrap();
         assert!(report.contains("bash.ws 的结论：DNS is not leaking."));
+        assert!(report.contains("本平台不检测"));
+    }
+
+    #[test]
+    fn a_platform_webrtc_probe_adds_the_webrtc_check() {
+        let mut test_env = env(ipv4_only);
+        test_env.webrtc = Some(webrtc_clean);
+        let observations = run_checks(&settings("4657"), &test_env);
+        let findings = netcheck::evaluate(&observations, &RealNetworks::parse("4657"));
+        let webrtc = findings.iter().find(|f| f.check == "WebRTC").unwrap();
+        assert_eq!(webrtc.verdict, Verdict::Ok);
+        let summary = netcheck::summarize(&observations, &findings);
+        assert_eq!(summary[0].verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn a_webrtc_leak_reaches_the_summary() {
+        let tool = NetcheckTool::with_env(env(ipv4_only)).with_webrtc(webrtc_leaking);
+        let observations = run_checks(&settings("4657"), &tool.env);
+        let findings = netcheck::evaluate(&observations, &RealNetworks::parse("4657"));
+        let summary = netcheck::summarize(&observations, &findings);
+        assert_eq!(summary[0].verdict, Verdict::Leak);
+        assert_eq!(summary[1].verdict, Verdict::Leak);
+        assert!(summary[1].detail.contains("WebRTC"));
     }
 
     #[test]
@@ -658,6 +754,7 @@ mod tests {
             "ip_endpoint",
             "ipv6_endpoint",
             "dns_endpoint",
+            "stun_server",
         ] {
             assert!(declared.contains(&key), "{key} 没在设置页里声明");
         }

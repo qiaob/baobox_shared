@@ -8,7 +8,11 @@
 //! | 出口 IP | 当前公网 IPv4 属于谁、在哪、是不是机房 | 出口就是「真实网络」（隧道没生效） |
 //! | IPv6 | 有没有 IPv6 出口、它属于谁 | IPv6 走了另一条路（与 IPv4 出口不是同一家） |
 //! | DNS | 实际替你查 DNS 的服务器属于谁 | 其中有「真实网络」的服务器 |
+//! | WebRTC | 网页经 STUN 拿到的候选地址（平台提供内置浏览器时才测） | 公网地址不是出口 IP（UDP 绕过了隧道） |
 //! | 时区 | 系统时区与出口 IP 所在时区 | 不算泄露，但不一致时 App 能看出你在用代理 |
+//!
+//! 五项之上还有一份**总结**（[`summarize`]），按用户真正关心的两件事回答：
+//! 运营商能不能看到你的流量；App 能不能看出你的真实位置。
 //!
 //! 「真实网络」由用户声明：关掉 VPN 跑一次，把显示的 ASN 填进设置（[`RealNetworks`]）。
 //! 不声明也能用，只是判不出「泄露给了谁」，只报告看到了什么。
@@ -26,6 +30,7 @@
 //!   bash.ws 的权威 DNS 就能记下是谁来问的；再取结果（[`parse_bashws`]）。
 
 use crate::json::{self, Json};
+use std::net::IpAddr;
 
 /// 一个 IP 的归属与位置。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -410,6 +415,99 @@ pub struct Observations {
     pub dns: Result<DnsResult, String>,
     /// 系统时区（IANA 名）。平台给不出就是 `None`
     pub system_timezone: Option<String>,
+    /// WebRTC 收集到的 ICE 候选（`candidate:…` 原文，一行一个）。
+    /// `None` = 平台没有内置浏览器、不测这一项；`Some(Err)` = 测了但失败了
+    pub webrtc: Option<Result<Vec<String>, String>>,
+}
+
+/// ICE 候选的类型（`typ` 后面那个词）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// 本机网卡上的地址
+    Host,
+    /// STUN 服务器看到的公网地址（NAT 之后）
+    ServerReflexive,
+    /// 对端看到的地址
+    PeerReflexive,
+    /// TURN 中继
+    Relay,
+}
+
+/// 一条 ICE 候选里检测关心的部分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// 类型
+    pub kind: CandidateKind,
+    /// 地址：IP，或者浏览器混淆过的 `xxxx.local`（mDNS）
+    pub address: String,
+    /// `udp` / `tcp`
+    pub protocol: String,
+}
+
+impl Candidate {
+    /// 地址被浏览器换成了 mDNS 名字（`….local`）：网页拿不到真实的内网地址。
+    pub fn is_mdns(&self) -> bool {
+        self.address.to_ascii_lowercase().ends_with(".local")
+    }
+}
+
+/// 解析一条 ICE 候选：
+/// `candidate:842163049 1 udp 1677729535 203.0.113.7 54321 typ srflx raddr 0.0.0.0 rport 0 …`。
+///
+/// 前面带不带 `a=` 都认；字段不够、没有 `typ` 或类型认不出返回 `None`。
+pub fn parse_candidate(line: &str) -> Option<Candidate> {
+    let line = line.trim();
+    let line = line.strip_prefix("a=").unwrap_or(line);
+    let body = line.strip_prefix("candidate:")?;
+    let fields: Vec<&str> = body.split_whitespace().collect();
+    // foundation component protocol priority address port typ <kind>
+    if fields.len() < 8 || fields[6] != "typ" {
+        return None;
+    }
+    let kind = match fields[7] {
+        "host" => CandidateKind::Host,
+        "srflx" => CandidateKind::ServerReflexive,
+        "prflx" => CandidateKind::PeerReflexive,
+        "relay" => CandidateKind::Relay,
+        _ => return None,
+    };
+    Some(Candidate {
+        kind,
+        address: fields[4].trim_matches(['[', ']']).to_string(),
+        protocol: fields[2].to_ascii_lowercase(),
+    })
+}
+
+/// 是不是公网地址。认不出的（mDNS 名字、乱码）不算。
+fn is_public(address: &str) -> bool {
+    match address.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let [a, b, ..] = v4.octets();
+            // 100.64.0.0/10 是运营商级 NAT，Tailscale 的地址也在这里
+            let shared = a == 100 && (64..128).contains(&b);
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_documentation()
+                || shared)
+        }
+        Ok(IpAddr::V6(v6)) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local())
+        }
+        Err(_) => false,
+    }
+}
+
+/// 两个地址是不是同一个（IPv6 的不同写法算同一个）。
+fn same_address(a: &str, b: &str) -> bool {
+    match (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a.eq_ignore_ascii_case(b),
+    }
 }
 
 /// 出口 IP 那一项。
@@ -546,6 +644,86 @@ fn judge_dns(dns: &Result<DnsResult, String>, real: &RealNetworks) -> Finding {
     Finding::new(CHECK, Verdict::Ok, detail)
 }
 
+/// WebRTC 那一项。
+///
+/// 网页能经 STUN 拿到的公网地址，应当就是出口 IP（或出口的 IPv6）。不是的话，
+/// UDP 绕过了隧道 —— 常见于只接管 TCP 的「系统代理」。内网地址被看到不算泄露真实位置，
+/// 只是提示；浏览器用 mDNS 名字代替内网地址的，什么也看不到。
+fn judge_webrtc(
+    webrtc: &Result<Vec<String>, String>,
+    ipv4: &Result<IpInfo, String>,
+    ipv6: &Result<Option<IpInfo>, String>,
+) -> Finding {
+    const CHECK: &str = "WebRTC";
+    let lines = match webrtc {
+        Ok(lines) => lines,
+        Err(why) => return Finding::new(CHECK, Verdict::Unknown, format!("测不出：{why}")),
+    };
+    let candidates: Vec<Candidate> = lines.iter().filter_map(|l| parse_candidate(l)).collect();
+    let exits: Vec<&str> = [
+        ipv4.as_ref().ok().map(|i| i.ip.as_str()),
+        ipv6.as_ref()
+            .ok()
+            .and_then(|i| i.as_ref())
+            .map(|i| i.ip.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut public: Vec<&str> = Vec::new();
+    let mut local: Vec<&str> = Vec::new();
+    for candidate in &candidates {
+        if candidate.kind == CandidateKind::Relay || candidate.is_mdns() {
+            continue;
+        }
+        let address = candidate.address.as_str();
+        let bucket = if is_public(address) {
+            &mut public
+        } else {
+            &mut local
+        };
+        if !bucket.iter().any(|a| same_address(a, address)) {
+            bucket.push(address);
+        }
+    }
+
+    if exits.is_empty() && !public.is_empty() {
+        return Finding::new(
+            CHECK,
+            Verdict::Unknown,
+            format!("网页能看到 {}，但不知道出口 IP，比不了", public.join("、")),
+        );
+    }
+    let stray: Vec<&str> = public
+        .iter()
+        .copied()
+        .filter(|a| !exits.iter().any(|e| same_address(e, a)))
+        .collect();
+    if !stray.is_empty() {
+        return Finding::new(
+            CHECK,
+            Verdict::Leak,
+            format!(
+                "网页能看到 {}，不是出口 IP —— UDP 绕过了隧道",
+                stray.join("、")
+            ),
+        );
+    }
+    if !local.is_empty() {
+        return Finding::new(
+            CHECK,
+            Verdict::Notice,
+            format!("网页能看到你的内网地址 {}（不暴露位置）", local.join("、")),
+        );
+    }
+    if public.is_empty() {
+        Finding::new(CHECK, Verdict::Ok, "网页拿不到任何公网地址")
+    } else {
+        Finding::new(CHECK, Verdict::Ok, "网页看到的公网地址就是出口 IP")
+    }
+}
+
 /// 时区那一项。
 fn judge_timezone(system: Option<&str>, ipv4: &Result<IpInfo, String>) -> Finding {
     const CHECK: &str = "时区";
@@ -567,14 +745,142 @@ fn judge_timezone(system: Option<&str>, ipv4: &Result<IpInfo, String>) -> Findin
     }
 }
 
-/// 把原料变成四项结论，顺序固定：出口、IPv6、DNS、时区。
+/// 把原料变成各项结论，顺序固定：出口、IPv6、DNS、WebRTC、时区。
+///
+/// 平台不测 WebRTC（`observations.webrtc` 是 `None`）时没有 WebRTC 那一项，
+/// 不算「测不出」—— 不然没有内置浏览器的平台永远拿不到「没有泄露」。
 pub fn evaluate(observations: &Observations, real: &RealNetworks) -> Vec<Finding> {
-    vec![
+    let mut findings = vec![
         judge_exit(&observations.ipv4, real),
         judge_ipv6(&observations.ipv6, &observations.ipv4, real),
         judge_dns(&observations.dns, real),
-        judge_timezone(observations.system_timezone.as_deref(), &observations.ipv4),
-    ]
+    ];
+    if let Some(webrtc) = &observations.webrtc {
+        findings.push(judge_webrtc(webrtc, &observations.ipv4, &observations.ipv6));
+    }
+    findings.push(judge_timezone(
+        observations.system_timezone.as_deref(),
+        &observations.ipv4,
+    ));
+    findings
+}
+
+/// 总结的第一问。
+pub const GOAL_CARRIER: &str = "运营商能看到你的流量吗";
+/// 总结的第二问。
+pub const GOAL_LOCATION: &str = "App 能看出你的真实位置吗";
+
+/// 按名字找一项结论。
+fn verdict_of(findings: &[Finding], check: &str) -> Option<Verdict> {
+    findings
+        .iter()
+        .find(|f| f.check == check)
+        .map(|f| f.verdict)
+}
+
+/// 把各项结论收成两个问题的回答：[`GOAL_CARRIER`] 与 [`GOAL_LOCATION`]。
+///
+/// - **运营商**：出口、IPv6、DNS、WebRTC 任何一项漏了，运营商就看得到那部分流量
+///   （至少看得到访问了哪些域名；内容走 HTTPS 的看不到）。都没漏，运营商只看得到
+///   你连着隧道入口，看不到去了哪
+/// - **真实位置**：出口、IPv6、WebRTC 漏了，App 能直接拿到真实 IP，也就知道大致位置。
+///   DNS 泄露只让网站（不是一般 App）看到你的运营商，算提示；机房 IP、时区不一致
+///   暴露的是「在用代理」，不是位置，也算提示
+pub fn summarize(observations: &Observations, findings: &[Finding]) -> Vec<Finding> {
+    let is = |check: &str, v: Verdict| verdict_of(findings, check) == Some(v);
+    let named = |checks: &[&'static str], v: Verdict| -> Vec<&'static str> {
+        checks.iter().copied().filter(|c| is(c, v)).collect()
+    };
+    let tunnel_checks: &[&'static str] = &["出口", "IPv6", "DNS", "WebRTC"];
+
+    // 第一问：运营商
+    let carrier = if is("出口", Verdict::Leak) {
+        Finding::new(
+            GOAL_CARRIER,
+            Verdict::Leak,
+            "能 —— 隧道没生效，你访问的每个网站运营商都看得到",
+        )
+    } else {
+        let leaked = named(tunnel_checks, Verdict::Leak);
+        let unknown = named(tunnel_checks, Verdict::Unknown);
+        if !leaked.is_empty() {
+            Finding::new(
+                GOAL_CARRIER,
+                Verdict::Leak,
+                format!(
+                    "能看到一部分 —— {} 没走隧道，运营商看得到这部分访问了哪里",
+                    leaked.join("、")
+                ),
+            )
+        } else if !unknown.is_empty() {
+            Finding::new(
+                GOAL_CARRIER,
+                Verdict::Unknown,
+                format!("说不准 —— {} 没测出来", unknown.join("、")),
+            )
+        } else {
+            Finding::new(
+                GOAL_CARRIER,
+                Verdict::Ok,
+                "看不到 —— 流量都进了隧道，运营商只看得到你连着隧道入口",
+            )
+        }
+    };
+
+    // 第二问：真实位置
+    let exit_place = observations
+        .ipv4
+        .as_ref()
+        .ok()
+        .map(|i| {
+            [i.city.as_str(), i.country.as_str()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty());
+    let ip_checks: &[&'static str] = &["出口", "IPv6", "WebRTC"];
+    let leaked = named(ip_checks, Verdict::Leak);
+    let unknown = named(ip_checks, Verdict::Unknown);
+    let mut hints = Vec::new();
+    if is("出口", Verdict::Notice) {
+        hints.push("出口是机房 IP");
+    }
+    if is("时区", Verdict::Notice) {
+        hints.push("系统时区与出口不一致");
+    }
+    if is("DNS", Verdict::Leak) {
+        hints.push("网站能从 DNS 看出你的运营商");
+    }
+    let location = if !leaked.is_empty() {
+        Finding::new(
+            GOAL_LOCATION,
+            Verdict::Leak,
+            format!("能 —— {} 暴露了你的真实 IP", leaked.join("、")),
+        )
+    } else if !unknown.is_empty() {
+        Finding::new(
+            GOAL_LOCATION,
+            Verdict::Unknown,
+            format!("说不准 —— {} 没测出来", unknown.join("、")),
+        )
+    } else {
+        let seen = match &exit_place {
+            Some(place) => format!("看不出 —— App 看到的位置是 {place}"),
+            None => "看不出 —— App 只看得到出口 IP".to_string(),
+        };
+        if hints.is_empty() {
+            Finding::new(GOAL_LOCATION, Verdict::Ok, seen)
+        } else {
+            Finding::new(
+                GOAL_LOCATION,
+                Verdict::Notice,
+                format!("{seen}；但能看出你在用代理：{}", hints.join("、")),
+            )
+        }
+    };
+    vec![carrier, location]
 }
 
 /// 整体结论：有泄露就是泄露；否则有测不出的就是测不出；否则有提示就是提示。
@@ -621,7 +927,161 @@ mod tests {
             ipv6: Ok(None),
             dns: Ok(parse_bashws(BASHWS_OK).unwrap()),
             system_timezone: Some("Asia/Singapore".to_string()),
+            webrtc: None,
         }
+    }
+
+    /// Chrome 的候选原文（地址换成了文档地址 / gcp-us 出口）
+    const HOST_MDNS: &str = "candidate:1840965416 1 udp 2113937151 5f0b4c1e-9a2d-4d8e-b0c1-1a2b3c4d5e6f.local 54321 typ host generation 0 ufrag abcd network-cost 999";
+    const HOST_LAN: &str = "candidate:3 1 udp 2122260223 192.168.0.23 50000 typ host generation 0";
+    const SRFLX_EXIT: &str = "candidate:842163049 1 udp 1677729535 34.3.107.77 61234 typ srflx raddr 0.0.0.0 rport 0 generation 0";
+    const SRFLX_HOME: &str = "a=candidate:842163050 1 udp 1677729535 82.66.115.249 61235 typ srflx raddr 192.168.0.23 rport 50000";
+
+    fn with_webrtc(lines: &[&str]) -> Observations {
+        let mut o = obs(parse_ipapi(ANON_GCP).unwrap());
+        o.system_timezone = Some("America/Los_Angeles".to_string());
+        o.webrtc = Some(Ok(lines.iter().map(|l| l.to_string()).collect()));
+        o
+    }
+
+    fn webrtc_finding(o: &Observations) -> Finding {
+        evaluate(o, &RealNetworks::parse("4657"))
+            .into_iter()
+            .find(|f| f.check == "WebRTC")
+            .unwrap()
+    }
+
+    #[test]
+    fn ice_candidates_are_parsed() {
+        let c = parse_candidate(SRFLX_HOME).unwrap();
+        assert_eq!(c.kind, CandidateKind::ServerReflexive);
+        assert_eq!(c.address, "82.66.115.249");
+        assert_eq!(c.protocol, "udp");
+        assert!(parse_candidate(HOST_MDNS).unwrap().is_mdns());
+        assert_eq!(
+            parse_candidate("candidate:1 1 udp 1 1.2.3.4 5 typ weird"),
+            None
+        );
+        assert_eq!(parse_candidate("not a candidate"), None);
+        assert_eq!(parse_candidate("candidate:1 1 udp"), None);
+    }
+
+    #[test]
+    fn public_and_private_addresses_are_told_apart() {
+        assert!(is_public("34.3.107.77"));
+        assert!(is_public("2406:3003::1"));
+        assert!(!is_public("192.168.0.23"));
+        assert!(
+            !is_public("100.101.102.103"),
+            "Tailscale / 运营商级 NAT 不算公网"
+        );
+        assert!(!is_public("fd7a:115c:a1e0::1"));
+        assert!(!is_public("fe80::1"));
+        assert!(!is_public("abc.local"));
+        assert!(same_address("2001:db8::1", "2001:0db8:0:0::1"));
+    }
+
+    #[test]
+    fn a_stun_address_other_than_the_exit_is_a_webrtc_leak() {
+        let o = with_webrtc(&[HOST_MDNS, SRFLX_HOME]);
+        let finding = webrtc_finding(&o);
+        assert_eq!(finding.verdict, Verdict::Leak);
+        assert!(finding.detail.contains("82.66.115.249"));
+    }
+
+    #[test]
+    fn a_stun_address_equal_to_the_exit_is_fine() {
+        let o = with_webrtc(&[HOST_MDNS, SRFLX_EXIT]);
+        assert_eq!(webrtc_finding(&o).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn an_exposed_lan_address_is_only_a_notice() {
+        let o = with_webrtc(&[HOST_LAN, SRFLX_EXIT]);
+        let finding = webrtc_finding(&o);
+        assert_eq!(finding.verdict, Verdict::Notice);
+        assert!(finding.detail.contains("192.168.0.23"));
+    }
+
+    #[test]
+    fn no_candidates_at_all_is_fine_and_a_failure_is_unknown() {
+        assert_eq!(webrtc_finding(&with_webrtc(&[])).verdict, Verdict::Ok);
+        let mut o = with_webrtc(&[]);
+        o.webrtc = Some(Err("内置浏览器没起来".to_string()));
+        assert_eq!(webrtc_finding(&o).verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn without_a_webrtc_probe_there_is_no_webrtc_finding() {
+        let findings = evaluate(
+            &obs(parse_ipapi(ANON_GCP).unwrap()),
+            &RealNetworks::default(),
+        );
+        assert_eq!(findings.len(), 4);
+        assert!(findings.iter().all(|f| f.check != "WebRTC"));
+    }
+
+    #[test]
+    fn webrtc_sits_between_dns_and_timezone() {
+        let findings = evaluate(&with_webrtc(&[SRFLX_EXIT]), &RealNetworks::default());
+        let names: Vec<&str> = findings.iter().map(|f| f.check).collect();
+        assert_eq!(names, ["出口", "IPv6", "DNS", "WebRTC", "时区"]);
+    }
+
+    #[test]
+    fn a_clean_tunnel_answers_no_to_both_goals() {
+        let o = with_webrtc(&[HOST_MDNS, SRFLX_EXIT]);
+        let findings = evaluate(&o, &RealNetworks::parse("4657"));
+        let summary = summarize(&o, &findings);
+        assert_eq!(summary[0].check, GOAL_CARRIER);
+        assert_eq!(summary[0].verdict, Verdict::Ok);
+        assert_eq!(summary[1].check, GOAL_LOCATION);
+        // 出口是 Google 的机房：位置看不出，但看得出在用代理
+        assert_eq!(summary[1].verdict, Verdict::Notice);
+        assert!(summary[1].detail.contains("The Dalles, United States"));
+        assert!(summary[1].detail.contains("机房"));
+    }
+
+    #[test]
+    fn a_webrtc_leak_answers_yes_to_both_goals() {
+        let o = with_webrtc(&[SRFLX_HOME]);
+        let findings = evaluate(&o, &RealNetworks::parse("4657"));
+        let summary = summarize(&o, &findings);
+        assert_eq!(summary[0].verdict, Verdict::Leak);
+        assert!(summary[0].detail.contains("WebRTC"));
+        assert_eq!(summary[1].verdict, Verdict::Leak);
+    }
+
+    #[test]
+    fn a_dns_leak_shows_the_carrier_but_not_the_location() {
+        let mut o = with_webrtc(&[SRFLX_EXIT]);
+        let mut dns = parse_bashws(BASHWS_OK).unwrap();
+        dns.resolvers[0].asn = Some(4657);
+        o.dns = Ok(dns);
+        let findings = evaluate(&o, &RealNetworks::parse("4657"));
+        let summary = summarize(&o, &findings);
+        assert_eq!(summary[0].verdict, Verdict::Leak);
+        assert_eq!(summary[1].verdict, Verdict::Notice);
+        assert!(summary[1].detail.contains("DNS"));
+    }
+
+    #[test]
+    fn the_tunnel_being_off_is_a_yes_to_both() {
+        let o = obs(parse_ipapi(ANON_HOME).unwrap());
+        let findings = evaluate(&o, &RealNetworks::parse("12322"));
+        let summary = summarize(&o, &findings);
+        assert_eq!(summary[0].verdict, Verdict::Leak);
+        assert!(summary[0].detail.contains("隧道没生效"));
+        assert_eq!(summary[1].verdict, Verdict::Leak);
+    }
+
+    #[test]
+    fn undeclared_real_networks_leave_the_carrier_question_open() {
+        let o = with_webrtc(&[SRFLX_EXIT]);
+        let findings = evaluate(&o, &RealNetworks::default());
+        let summary = summarize(&o, &findings);
+        assert_eq!(summary[0].verdict, Verdict::Unknown);
+        assert!(summary[0].detail.contains("DNS"));
     }
 
     #[test]
@@ -823,6 +1283,7 @@ mod tests {
             ipv6: Err("超时".to_string()),
             dns: Err("拿不到测试 id".to_string()),
             system_timezone: None,
+            webrtc: None,
         };
         let findings = evaluate(&observations, &RealNetworks::default());
         assert!(findings.iter().all(|f| f.verdict == Verdict::Unknown));

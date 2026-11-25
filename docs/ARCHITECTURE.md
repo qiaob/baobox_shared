@@ -58,7 +58,7 @@ baobox_shared/
 │   ├── clipboard    剪贴板历史模型：去重、收藏豁免、过期清理、索引编解码
 │   ├── privacy      敏感内容识别（密码 / 私钥 / 令牌 / 银行卡号，Luhn 校验）
 │   ├── textformat   文本格式识别（JSON / JWT / XML / URL / 时间戳 / Base64）与转换动作
-│   ├── netcheck     网络泄露检测：解析 ipapi.is / bash.ws 的回包，判定出口、IPv6、DNS、时区四项
+│   ├── netcheck     网络泄露检测：解析 ipapi.is / bash.ws 的回包，判定出口、IPv6、DNS、WebRTC、时区五项并总结
 │   ├── snippet      文本片段的关键字展开匹配
 │   ├── caffeinate   防休眠的时长预设、到期判定、状态文案
 │   ├── layout       窗口布局的纯几何（半屏 / 四分屏 / 居中 / 间距 / 跨屏）
@@ -477,15 +477,20 @@ Windows 还有一条**所有权规则**：`SetClipboardData` 成功之后内存�
 
 ### 网络泄露检测
 
-开着代理 / VPN / Tailscale 出口节点时，回答「有没有东西绕过了隧道」。四项检测各出结论：
+开着代理 / VPN / Tailscale 出口节点时，回答「有没有东西绕过了隧道」。五项检测各出结论：
 出口 IP（属于谁、是不是机房）、IPv6（有没有走另一条路）、DNS（谁在替你查询）、
+WebRTC（网页经 STUN 拿到的公网地址是不是出口 IP —— 只接管 TCP 的系统代理在这里漏）、
 时区（系统与出口是否一致 —— 不算泄露，但 App 能据此看出你在用代理）。
+
+五项之上是一份**总结**（`summarize`），按两个问题回答：**运营商能看到你的流量吗**
+（出口 / IPv6 / DNS / WebRTC 任一项漏了就能看到那部分）、**App 能看出你的真实位置吗**
+（出口 / IPv6 / WebRTC 漏了就能；DNS 泄露、机房 IP、时区不一致只算「看得出在用代理」）。
 
 | 层 | 放什么 |
 |---|---|
 | `baobox_core::netcheck` | 回包解析与判定，全部能在开发机上测 |
 | `baobox_app::netcheck_tool` | 请求顺序、后台线程、菜单与设置（工具 id `netcheck`） |
-| 平台层 | 两个函数：`HttpGet`（HTTPS GET，要设超时）与 `SystemTimezone`（系统的 IANA 时区名） |
+| 平台层 | 两个函数：`HttpGet`（HTTPS GET，要设超时）与 `SystemTimezone`（系统的 IANA 时区名）；可选第三个 `WebrtcProbe`（内置浏览器收集 ICE 候选，`with_webrtc` 传入） |
 
 与 AI 助手同一个做法：平台只在注册时传进两个函数指针。**HTTPS 留在平台**是因为
 标准库没有 TLS，而两个平台各有现成的（Windows 的 WinHTTP、Linux 的 HTTP 库），
@@ -501,13 +506,19 @@ Windows 还有一条**所有权规则**：`SetClipboardData` 成功之后内存�
   两种形状都认；没有 key 时机房判定退回内置的一张主要云厂商 ASN 表，宁缺毋滥
 - **bash.ws 回 `error`（一台解析器都没来）报「测不出」**，不当成「没泄露」 —— 实测在 DNS 不通的环境里就是这样
 - **连不上纯 IPv6 的地址按「没有 IPv6 出口」**：两者在客户端分不开，而这正是不会漏的那种情况
+- **WebRTC 要一个真浏览器**：STUN 的结果取决于浏览器自己的 UDP 栈与 mDNS 混淆，
+  用 Rust 发一个 STUN 包测的是另一条路。平台没有内置浏览器就不出这一项（不算「测不出」，
+  否则这些平台永远拿不到「没有泄露」），报告里写明「本平台不检测」。
+  浏览器用 mDNS 名字（`….local`）代替的内网地址不算暴露；`100.64.0.0/10`（Tailscale）算内网
 
 | | Linux | Windows |
 |---|---|---|
 | `HttpGet` | 待接入 | 待接入（WinHTTP） |
 | `SystemTimezone` | `/etc/localtime` 的链接目标 | Windows 时区名 → IANA（系统自带的 ICU 可换算） |
+| `WebrtcProbe` | 待接入（WebKitGTK） | 待接入（WebView2） |
 
-macOS 版按同一套规格用 Swift 另写（URLSession + `TimeZone.current.identifier`）。
+macOS 版按同一套规格用 Swift 另写（URLSession + `TimeZone.current.identifier`，
+WebRTC 用隐藏的 `WKWebView`，与「手机互传」同一个做法）。
 
 ### 其余一个工具
 
