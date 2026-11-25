@@ -32,6 +32,7 @@ pub mod history;
 pub mod hotkey;
 pub mod json;
 pub mod layout;
+pub mod netcheck;
 pub mod ocr;
 pub mod privacy;
 pub mod selection;

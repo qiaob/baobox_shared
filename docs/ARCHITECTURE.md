@@ -58,6 +58,7 @@ baobox_shared/
 │   ├── clipboard    剪贴板历史模型：去重、收藏豁免、过期清理、索引编解码
 │   ├── privacy      敏感内容识别（密码 / 私钥 / 令牌 / 银行卡号，Luhn 校验）
 │   ├── textformat   文本格式识别（JSON / JWT / XML / URL / 时间戳 / Base64）与转换动作
+│   ├── netcheck     网络泄露检测：解析 ipapi.is / bash.ws 的回包，判定出口、IPv6、DNS、时区四项
 │   ├── snippet      文本片段的关键字展开匹配
 │   ├── caffeinate   防休眠的时长预设、到期判定、状态文案
 │   ├── layout       窗口布局的纯几何（半屏 / 四分屏 / 居中 / 间距 / 跨屏）
@@ -473,6 +474,40 @@ Windows 还有一条**所有权规则**：`SetClipboardData` 成功之后内存�
 **键盘滚动（j/k 滚页面）没有做**：它要一个「只收滚动键、别的都放行」的全局
 键盘监听 —— 与关键字展开是同一类代码，也是同一个理由没做。键位映射
 （`hints::Scroll`）已经写好并测过，缺的只是喂按键那一层。
+
+### 网络泄露检测
+
+开着代理 / VPN / Tailscale 出口节点时，回答「有没有东西绕过了隧道」。四项检测各出结论：
+出口 IP（属于谁、是不是机房）、IPv6（有没有走另一条路）、DNS（谁在替你查询）、
+时区（系统与出口是否一致 —— 不算泄露，但 App 能据此看出你在用代理）。
+
+| 层 | 放什么 |
+|---|---|
+| `baobox_core::netcheck` | 回包解析与判定，全部能在开发机上测 |
+| `baobox_app::netcheck_tool` | 请求顺序、后台线程、菜单与设置（工具 id `netcheck`） |
+| 平台层 | 两个函数：`HttpGet`（HTTPS GET，要设超时）与 `SystemTimezone`（系统的 IANA 时区名） |
+
+与 AI 助手同一个做法：平台只在注册时传进两个函数指针。**HTTPS 留在平台**是因为
+标准库没有 TLS，而两个平台各有现成的（Windows 的 WinHTTP、Linux 的 HTTP 库），
+在这里引 rustls 要为一个菜单工具背一整套 TLS 栈。DNS 探测用标准库的系统解析器 ——
+那正是要测的那条路。
+
+几条取舍：
+
+- **只在用户点了才测**。每次检测都会把出口 IP 告诉 ipapi.is 与 bash.ws，所以启动时不测、也不定时测
+- **「泄露」要用户声明真实网络才判得出**：关掉 VPN 测一次，把出口的 ASN 填进设置。
+  不声明也能用，只报告看到了什么（DNS 那项给「测不出」，不假装没问题）
+- **ipapi.is 2026-09-01 起，不带 key 的回包没有机房 / VPN 判定**（`asn` 也从对象变成了字符串）。
+  两种形状都认；没有 key 时机房判定退回内置的一张主要云厂商 ASN 表，宁缺毋滥
+- **bash.ws 回 `error`（一台解析器都没来）报「测不出」**，不当成「没泄露」 —— 实测在 DNS 不通的环境里就是这样
+- **连不上纯 IPv6 的地址按「没有 IPv6 出口」**：两者在客户端分不开，而这正是不会漏的那种情况
+
+| | Linux | Windows |
+|---|---|---|
+| `HttpGet` | 待接入 | 待接入（WinHTTP） |
+| `SystemTimezone` | `/etc/localtime` 的链接目标 | Windows 时区名 → IANA（系统自带的 ICU 可换算） |
+
+macOS 版按同一套规格用 Swift 另写（URLSession + `TimeZone.current.identifier`）。
 
 ### 其余一个工具
 

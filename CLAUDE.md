@@ -11,8 +11,8 @@ Baobox 的 **Windows 版**（[`qiaob/baobox_windows`](https://github.com/qiaob/b
 
 | crate | 干什么 |
 |---|---|
-| `baobox-core/` | 纯逻辑，**零依赖**：几何、选区 / 编辑器状态机、标注、拼接、文件名、配置、历史、剪贴板模型、敏感内容、文本格式、片段、防休眠、窗口布局、JSON、AI 用量与会话、键盘点击标签 |
-| `baobox-app/` | 应用框架：`ToolModule` + `ToolRegistry`、菜单模型、设置声明、快捷键规格、配置文件读取、跨平台的工具 id（`tools/`）、两个 AI 助手工具 |
+| `baobox-core/` | 纯逻辑，**零依赖**：几何、选区 / 编辑器状态机、标注、拼接、文件名、配置、历史、剪贴板模型、敏感内容、文本格式、片段、防休眠、窗口布局、JSON、AI 用量与会话、键盘点击标签、网络泄露检测的判定 |
+| `baobox-app/` | 应用框架：`ToolModule` + `ToolRegistry`、菜单模型、设置声明、快捷键规格、配置文件读取、跨平台的工具 id（`tools/`）、两个 AI 助手工具、网络泄露检测工具 |
 | `baobox-render/` | 标注光栅化进 RGBA（逐像素一致）+ 工具条底板与图标（`chrome`） |
 | `baobox-image/` | PNG 编解码、灰度（唯一的第三方依赖 `png` 在这里） |
 
