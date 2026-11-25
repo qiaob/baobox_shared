@@ -552,6 +552,18 @@ fn judge_exit(ipv4: &Result<IpInfo, String>, real: &RealNetworks) -> Finding {
     }
 }
 
+/// 两个 ASN 是不是同一家：号码相同，或者在云厂商表里是同一家
+/// （Google 的 15169 / 396982、AWS 的 16509 / 14618 常常一个出 IPv4、一个出 IPv6）。
+fn same_network(a: Option<u32>, b: Option<u32>) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.and_then(known_hosting), b.and_then(known_hosting)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// IPv6 那一项。
 fn judge_ipv6(
     ipv6: &Result<Option<IpInfo>, String>,
@@ -571,17 +583,26 @@ fn judge_ipv6(
             format!("{} 是你的真实网络 —— IPv6 绕过了隧道", info.describe()),
         );
     }
-    if let Ok(v4) = ipv4 {
-        if info.asn.is_some() && v4.asn.is_some() && info.asn != v4.asn {
+    let v4 = match ipv4 {
+        Ok(v4) if v4.asn.is_some() && info.asn.is_some() => v4,
+        // 比不了：IPv4 出口没测出来，或者有一边认不出 ASN —— 不能说「一致」
+        _ => {
             return Finding::new(
                 CHECK,
-                Verdict::Leak,
-                format!(
-                    "{} 与 IPv4 出口不是同一家 —— IPv6 很可能没走隧道",
-                    info.describe()
-                ),
-            );
+                Verdict::Unknown,
+                format!("{}，但不知道 IPv4 出口是谁家，比不了", info.describe()),
+            )
         }
+    };
+    if !same_network(info.asn, v4.asn) {
+        return Finding::new(
+            CHECK,
+            Verdict::Leak,
+            format!(
+                "{} 与 IPv4 出口不是同一家 —— IPv6 很可能没走隧道",
+                info.describe()
+            ),
+        );
     }
     Finding::new(
         CHECK,
@@ -700,6 +721,20 @@ fn judge_webrtc(
         .copied()
         .filter(|a| !exits.iter().any(|e| same_address(e, a)))
         .collect();
+    // 同一族的出口没测出来（比如 IPv6 地址的归属没查到）：这个地址可能正是那个出口，比不了，不算泄露
+    let family_unknown = |address: &str| match address.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => ipv4.is_err(),
+        Ok(IpAddr::V6(_)) => ipv6.is_err(),
+        Err(_) => false,
+    };
+    if !stray.is_empty() && stray.iter().all(|a| family_unknown(a)) {
+        return Finding::new(
+            CHECK,
+            Verdict::Unknown,
+            format!("网页能看到 {}，但不知道出口 IP，比不了", stray.join("、")),
+        );
+    }
+    let stray: Vec<&str> = stray.into_iter().filter(|a| !family_unknown(a)).collect();
     if !stray.is_empty() {
         return Finding::new(
             CHECK,
@@ -845,7 +880,7 @@ pub fn summarize(observations: &Observations, findings: &[Finding]) -> Vec<Findi
     let unknown = named(ip_checks, Verdict::Unknown);
     let mut hints = Vec::new();
     if is("出口", Verdict::Notice) {
-        hints.push("出口是机房 IP");
+        hints.push("出口是机房 IP 或已知代理");
     }
     if is("时区", Verdict::Notice) {
         hints.push("系统时区与出口不一致");
@@ -1249,6 +1284,42 @@ mod tests {
         // 没声明真实网络也能判：与 IPv4 出口不是同一家
         let findings = evaluate(&observations, &RealNetworks::default());
         assert_eq!(findings[1].verdict, Verdict::Leak);
+    }
+
+    #[test]
+    fn an_ipv6_exit_from_the_same_cloud_under_another_asn_is_not_a_leak() {
+        let mut observations = obs(parse_ipapi(ANON_GCP).unwrap());
+        observations.ipv6 = Ok(Some(IpInfo {
+            ip: "2600:1900:4000::1".to_string(),
+            asn: Some(396982),
+            network: "Google LLC".to_string(),
+            ..IpInfo::default()
+        }));
+        let findings = evaluate(&observations, &RealNetworks::default());
+        assert_eq!(findings[1].verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn an_ipv6_exit_that_cannot_be_compared_is_unknown_not_a_match() {
+        let mut observations = obs(parse_ipapi(ANON_GCP).unwrap());
+        observations.ipv4 = Err("超时".to_string());
+        observations.ipv6 = Ok(Some(IpInfo {
+            ip: "2406:3003::1".to_string(),
+            asn: Some(4657),
+            ..IpInfo::default()
+        }));
+        let findings = evaluate(&observations, &RealNetworks::default());
+        assert_eq!(findings[1].verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn a_stun_address_whose_exit_lookup_failed_is_unknown_not_a_leak() {
+        let mut o = with_webrtc(&["candidate:9 1 udp 1 2406:3003::1 5 typ srflx raddr :: rport 0"]);
+        o.ipv6 = Err("IP 归属服务的回包看不懂".to_string());
+        assert_eq!(webrtc_finding(&o).verdict, Verdict::Unknown);
+        // 没有 IPv6 出口（不是没测出来）时网页却拿到了 IPv6：照样是泄露
+        o.ipv6 = Ok(None);
+        assert_eq!(webrtc_finding(&o).verdict, Verdict::Leak);
     }
 
     #[test]

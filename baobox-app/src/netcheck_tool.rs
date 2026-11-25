@@ -177,8 +177,9 @@ fn ipv6_exit(settings: &Settings, env: &Env) -> Result<Option<IpInfo>, String> {
         return Ok(None);
     };
     let ip = body.trim();
-    if !ip.contains(':') {
-        // 回了个 IPv4（服务被换成了双栈的）：说明这个地址测不了 IPv6
+    // 只认一个真正的 IPv6 地址：回了 IPv4（服务被换成了双栈的）或一页 HTML（门户页），
+    // 都说明这个地址测不了 IPv6，也别把回包原样拼进下一个请求的地址里
+    if ip.parse::<std::net::Ipv6Addr>().is_err() {
         return Err(format!("{} 回的不是 IPv6 地址", settings.ipv6_endpoint));
     }
     lookup(settings, env, Some(ip)).map(Some)
@@ -192,6 +193,10 @@ fn dns_leak(settings: &Settings, env: &Env) -> Result<DnsResult, String> {
         .map(|(_, rest)| rest)
         .unwrap_or(base)
         .split('/')
+        .next()
+        .unwrap_or("")
+        // 地址里带了端口（`https://bash.ws:443`）：域名里不能有端口
+        .split(':')
         .next()
         .unwrap_or("");
     if host.is_empty() {
@@ -231,6 +236,8 @@ pub struct Outcome {
     pub findings: Vec<Finding>,
     /// bash.ws 自己的结论文字（有的话）
     pub dns_conclusion: Option<String>,
+    /// 检测时有没有声明真实网络（报告里的提示按检测那一刻算，不按现在的设置）
+    pub real_declared: bool,
 }
 
 /// 整体结论的一句话。
@@ -311,6 +318,7 @@ impl NetcheckTool {
                 summary: netcheck::summarize(&observations, &findings),
                 findings,
                 dns_conclusion,
+                real_declared: !real.is_empty(),
             });
         });
     }
@@ -334,7 +342,7 @@ impl NetcheckTool {
         if let Some(words) = &outcome.dns_conclusion {
             lines.push(format!("bash.ws 的结论：{words}"));
         }
-        if RealNetworks::parse(&self.settings.real_networks).is_empty() {
+        if !outcome.real_declared {
             lines.push(
                 "提示：关掉代理 / VPN 测一次，把「出口」那行的 ASN 填进设置里的「真实网络」，\
                  才判得出 DNS 是否泄露给了你的运营商"
