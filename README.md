@@ -15,8 +15,8 @@ The platform repositories call into it directly; there are no platform traits to
 
 | Crate | What it is |
 |---|---|
-| [`baobox-core`](baobox-core) | Pure logic, zero dependencies: geometry, the selection and annotation-editor state machines, annotation model with undo, scrolling-capture stitching, toolbar layout, OCR reading order, hotkey parsing, filename templates (per-platform sanitizing), line-preserving INI config, screenshot and clipboard history, sensitive-content detection, text-format detection and conversion, snippets, keep-awake timing, window-layout geometry, a small JSON parser, AI usage / session-log parsing, keyboard-clicking hint labels |
-| [`baobox-app`](baobox-app) | The app framework: the `ToolModule` trait and `ToolRegistry` (registration order = menu order), tray menu model, settings declarations, hotkey specs, config-file loading, and the two AI assistant tools (they need nothing from the platform except a terminal launcher) |
+| [`baobox-core`](baobox-core) | Pure logic, zero dependencies: geometry, the selection and annotation-editor state machines, annotation model with undo, scrolling-capture stitching, toolbar layout, OCR reading order, hotkey parsing, filename templates (per-platform sanitizing), line-preserving INI config, screenshot and clipboard history, sensitive-content detection, text-format detection and conversion, snippets, keep-awake timing, window-layout geometry, a small JSON parser, AI usage / session-log parsing, keyboard-clicking hint labels, network-leak verdicts (exit IP, IPv6, DNS, timezone) |
+| [`baobox-app`](baobox-app) | The app framework: the `ToolModule` trait and `ToolRegistry` (registration order = menu order), tray menu model, settings declarations, hotkey specs, config-file loading, the two AI assistant tools (they need nothing from the platform except a terminal launcher), and the network-leak check (it needs an HTTPS GET and the system timezone from the platform) |
 | [`baobox-render`](baobox-render) | Rasterizes annotations into an RGBA buffer, pixel-identical on every platform; also draws the toolbar chrome and icons |
 | [`baobox-image`](baobox-image) | RGBA → PNG (file or memory), PNG → RGBA, RGBA → grayscale |
 
@@ -61,8 +61,8 @@ History before November 2026 comes from the `shared/` directory of the Baobox mo
 
 | crate | 是什么 |
 |---|---|
-| [`baobox-core`](baobox-core) | 纯逻辑，零依赖：几何运算、选区与标注编辑器状态机、标注模型与撤销、长截屏拼接、工具条布局、OCR 阅读顺序、快捷键解析、文件名模板（按平台消毒）、行级 INI 配置、截图与剪贴板历史、敏感内容识别、文本格式识别与转换、文本片段、防休眠计时、窗口布局几何、小型 JSON 解析器、AI 用量与会话日志、键盘点击的标签发号 |
-| [`baobox-app`](baobox-app) | 应用框架：`ToolModule` trait 与 `ToolRegistry`（注册顺序 = 菜单顺序）、托盘菜单模型、设置声明、快捷键规格、配置文件读取，以及两个 AI 助手工具（除了「开哪个终端」不需要平台提供任何东西） |
+| [`baobox-core`](baobox-core) | 纯逻辑，零依赖：几何运算、选区与标注编辑器状态机、标注模型与撤销、长截屏拼接、工具条布局、OCR 阅读顺序、快捷键解析、文件名模板（按平台消毒）、行级 INI 配置、截图与剪贴板历史、敏感内容识别、文本格式识别与转换、文本片段、防休眠计时、窗口布局几何、小型 JSON 解析器、AI 用量与会话日志、键盘点击的标签发号、网络泄露检测的判定（出口 IP、IPv6、DNS、WebRTC、时区）与总结 |
+| [`baobox-app`](baobox-app) | 应用框架：`ToolModule` trait 与 `ToolRegistry`（注册顺序 = 菜单顺序）、托盘菜单模型、设置声明、快捷键规格、配置文件读取，两个 AI 助手工具（除了「开哪个终端」不需要平台提供任何东西），以及网络泄露检测（要平台提供 HTTPS GET 与系统时区，可选内置浏览器跑 WebRTC） |
 | [`baobox-render`](baobox-render) | 把标注光栅化进 RGBA 缓冲，三平台逐像素一致；工具条底板与图标也是这里画的 |
 | [`baobox-image`](baobox-image) | RGBA → PNG（文件或内存）、PNG → RGBA、RGBA → 灰度 |
 

@@ -25,6 +25,7 @@ pub mod assistant_tool;
 pub mod config_file;
 pub mod hotkeys;
 pub mod menu;
+pub mod netcheck_tool;
 pub mod settings;
 pub mod tools;
 
